@@ -185,56 +185,191 @@ export default function Home() {
     .slice()
     .sort((a, b) => b.date.localeCompare(a.date))
 
+
   function parseVoiceText(raw: string): VoiceDraft[] {
+    const normalize = (value: string) =>
+      value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+
+    const actionPattern =
+      /\b(recebi|recebeu|ganhei|ganhou|fiz|faturei|entrou|entrou|rendeu|gastei|gastou|paguei|pagou|comprei|comprou|abasteci|abasteceu|desembolsei|despesa|custou|passei|investi)\b/i
+
     const clauses = raw
-      .replace(/\s+e\s+(?=(?:recebi|ganhei|faturei|entrei|gastei|paguei|comprei|abasteci|desembolsei)\b)/gi, '|')
+      .replace(/[.!?]+/g, '|')
+      .replace(/\s+e\s+(?=(?:recebi|recebeu|ganhei|ganhou|fiz|faturei|entrou|rendeu|gastei|gastou|paguei|pagou|comprei|comprou|abasteci|abasteceu|desembolsei|passei|investi)\b)/gi, '|')
+      .replace(/\s+(?:depois|tambem)\s+/gi, '|')
       .split(/[|;\n]+/)
       .map(part => part.trim())
       .filter(Boolean)
 
-    const expenseWords = /\b(gastei|paguei|comprei|abasteci|desembolsei|despesa|custou)\b/i
-    const knownPlatforms = platforms
+    const numberWords: Record<string, number> = {
+      zero: 0, um: 1, uma: 1, dois: 2, duas: 2,
+      tres: 3, quatro: 4, cinco: 5, seis: 6,
+      sete: 7, oito: 8, nove: 9, dez: 10,
+      onze: 11, doze: 12, treze: 13, catorze: 14,
+      quatorze: 14, quinze: 15, dezesseis: 16,
+      dezessete: 17, dezoito: 18, dezenove: 19,
+      vinte: 20, trinta: 30, quarenta: 40,
+      cinquenta: 50, sessenta: 60, setenta: 70,
+      oitenta: 80, noventa: 90,
+      cem: 100, cento: 100, duzentos: 200,
+      duzentas: 200, trezentos: 300, trezentas: 300,
+      quatrocentos: 400, quinhentos: 500,
+      quinhentas: 500, seiscentos: 600,
+      setecentos: 700, oitocentos: 800,
+      novecentos: 900,
+    }
+
+    const numberPattern = Object.keys(numberWords)
+      .sort((a, b) => b.length - a.length)
+      .join('|')
+
+    function parseWrittenNumber(value: string): number {
+      const words = normalize(value).split(/\s+e\s+|\s+/).filter(Boolean)
+      let total = 0
+      let current = 0
+
+      for (const word of words) {
+        if (word === 'mil') {
+          total += (current || 1) * 1000
+          current = 0
+        } else if (numberWords[word] !== undefined) {
+          current += numberWords[word]
+        }
+      }
+
+      return total + current
+    }
+
+    function extractAmount(clause: string): number | null {
+      const digitMatch = clause.match(
+        /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)/i
+      )
+
+      if (digitMatch) {
+        const value = digitMatch[1].includes(',')
+          ? digitMatch[1].replace(/\./g, '').replace(',', '.')
+          : digitMatch[1]
+
+        const amount = Number(value)
+        return Number.isFinite(amount) && amount > 0 ? amount : null
+      }
+
+      const writtenMatch = normalize(clause).match(
+        new RegExp(`\\b(?:${numberPattern})(?:\\s+e\\s+(?:${numberPattern}))*\\b`, 'i')
+      )
+
+      if (!writtenMatch) return null
+
+      const afterNumber = normalize(clause.slice(
+        writtenMatch.index! + writtenMatch[0].length
+      ))
+
+      const hasCurrencyOrContext =
+        /^\s*(?:reais?|real|de\b|no\b|na\b|do\b|da\b|em\b|para\b|com\b)/i.test(afterNumber)
+
+      if (!hasCurrencyOrContext || !actionPattern.test(clause)) return null
+
+      const amount = parseWrittenNumber(writtenMatch[0])
+      return amount > 0 ? amount : null
+    }
+
+    const aliases: Record<string, string[]> = {
+      'iFood': ['ifood', 'i food'],
+      'Rappi': ['rappi'],
+      'Uber Flash': ['uber flash', 'uber'],
+      'Mercado Livre': ['mercado livre', 'mercado-livre', 'ml'],
+      'Shopee': ['shopee'],
+      'SHEIN': ['shein'],
+      'Amazon': ['amazon'],
+      'Loggi': ['loggi'],
+      'Lalamove': ['lalamove'],
+    }
+
     const drafts: VoiceDraft[] = []
 
     for (const clause of clauses) {
-      const match = clause.match(/(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)/i)
-      if (!match) continue
-      const rawAmount = match[1]
-      const normalizedAmount = rawAmount.includes(',') ? rawAmount.replace(/\./g, '').replace(',', '.') : rawAmount
-      const value = Number(normalizedAmount)
-      if (!Number.isFinite(value) || value <= 0) continue
+      const lower = normalize(clause)
+      const amount = extractAmount(clause)
 
-      const type: Kind = expenseWords.test(clause) ? 'expense' : 'income'
-      const lower = clause.toLowerCase()
-      const foundPlatform = type === 'income'
-        ? knownPlatforms.find(item => lower.includes(item.toLowerCase())) ?? ''
-        : ''
+      if (!amount) continue
+
+      const expenseWords =
+        /\b(gastei|gastou|paguei|pagou|comprei|comprou|abasteci|abasteceu|desembolsei|despesa|custou|passei|investi)\b/
+
+      const incomeWords =
+        /\b(recebi|recebeu|ganhei|ganhou|fiz|faturei|entrou|rendeu)\b/
+
+      const type: Kind = expenseWords.test(lower) && !incomeWords.test(lower)
+        ? 'expense'
+        : 'income'
+
+      let foundPlatform = ''
+
+      if (type === 'income') {
+        for (const [platform, names] of Object.entries(aliases)) {
+          if (names.some(name => {
+            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            return new RegExp(`\\b${escaped}\\b`, 'i').test(lower)
+          })) {
+            foundPlatform = platform
+            break
+          }
+        }
+      }
+
       let category = type === 'income' ? 'Delivery' : 'Outros'
-      if (type === 'expense') {
-        if (/gasolina|combust[ií]vel|etanol|diesel|abasteci/.test(lower)) category = 'Combustível'
-        else if (/ped[aá]gio/.test(lower)) category = 'Pedágio'
-        else if (/almo[cç]o|comida|lanche|alimenta/.test(lower)) category = 'Alimentação'
-        else if (/[áa]gua|hidrata/.test(lower)) category = 'Hidratação'
-        else if (/manuten|oficina|pneu|óleo/.test(lower)) category = 'Manutenção'
-        else if (/estacion/.test(lower)) category = 'Estacionamento'
-      } else if (/gorjeta/.test(lower)) category = 'Gorjetas'
-      else if (/b[oô]nus|incentivo/.test(lower)) category = 'Bônus'
 
-      const description = clause
-        .replace(/(?:r\$\s*)?\d+(?:[.,]\d{1,2})?\s*(?:reais?)?/i, '')
-        .replace(/\b(recebi|ganhei|faturei|entrou|gastei|paguei|comprei|abasteci|desembolsei)\b/gi, '')
-        .replace(/\b(do|da|de|no|na|com|em)\b/gi, ' ')
-        .replace(new RegExp(foundPlatform.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '')
-        .replace(/\s+/g, ' ').trim()
+      if (type === 'expense') {
+        if (/\b(gasolina|combustivel|etanol|diesel|abasteci|posto)\b/.test(lower)) {
+          category = 'Combustível'
+        } else if (/\b(pedagio|sem parar)\b/.test(lower)) {
+          category = 'Pedágio'
+        } else if (/\b(almoco|jantar|comida|lanche|alimentacao|restaurante)\b/.test(lower)) {
+          category = 'Alimentação'
+        } else if (/\b(agua|hidratacao|bebida)\b/.test(lower)) {
+          category = 'Hidratação'
+        } else if (/\b(manutencao|oficina|pneu|oleo|reparo)\b/.test(lower)) {
+          category = 'Manutenção'
+        } else if (/\b(estacionamento|estacionei)\b/.test(lower)) {
+          category = 'Estacionamento'
+        }
+      } else if (/\b(gorjeta|caixinha)\b/.test(lower)) {
+        category = 'Gorjetas'
+      } else if (/\b(bonus|incentivo|premio)\b/.test(lower)) {
+        category = 'Bônus'
+      }
+
+      let description = clause
+        .replace(/(?:r\$\s*)?\d{1,3}(?:\.\d{3})*(?:[.,]\d{1,2})?/i, '')
+        .replace(new RegExp(`\\b(?:${numberPattern})(?:\\s+e\\s+(?:${numberPattern}))*\\b`, 'i'), '')
+        .replace(actionPattern, '')
+        .replace(/\b(?:reais?|real|do|da|de|no|na|com|em|para|hoje|ontem)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+      if (foundPlatform) {
+        const platformRegex = new RegExp(
+          aliases[foundPlatform].map(name =>
+            name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          ).join('|'),
+          'i'
+        )
+        description = description.replace(platformRegex, '').replace(/\s+/g, ' ').trim()
+      }
 
       drafts.push({
         type,
-        amount: String(value.toFixed(2)),
-        description: description || (type === 'income' ? (foundPlatform ? `Entrega ${foundPlatform}` : 'Receita registrada por voz') : 'Despesa registrada por voz'),
+        amount: amount.toFixed(2),
+        description: description || (
+          type === 'income'
+            ? (foundPlatform ? `Entrega ${foundPlatform}` : 'Receita registrada por voz')
+            : 'Despesa registrada por voz'
+        ),
         category,
         platform: foundPlatform,
       })
     }
+
     return drafts
   }
 
