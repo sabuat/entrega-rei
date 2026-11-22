@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 
 type Screen = 'home' | 'add' | 'reports' | 'history'
@@ -95,6 +95,7 @@ export default function Home() {
   const [toast, setToast] = useState('')
   const [saving, setSaving] = useState(false)
   const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'review'>('idle')
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
   const [voiceText, setVoiceText] = useState('')
   const [voiceDrafts, setVoiceDrafts] = useState<VoiceDraft[]>([])
   const [voiceError, setVoiceError] = useState('')
@@ -238,6 +239,7 @@ export default function Home() {
   }
 
   function startVoice() {
+    if (recognitionRef.current || voiceState === 'listening') return
     setVoiceError('')
     setVoiceText('')
     setVoiceDrafts([])
@@ -268,12 +270,23 @@ export default function Home() {
         ? 'Permita o acesso ao microfone nas configurações do navegador.'
         : 'Não foi possível captar sua voz. Tente novamente ou registre manualmente.')
     }
-    recognition.onend = () => setVoiceState(current => current === 'listening' ? 'idle' : current)
+    recognition.onend = () => {
+      recognitionRef.current = null
+      setVoiceState(current => current === 'listening' ? 'idle' : current)
+    }
+    recognitionRef.current = recognition
     setVoiceState('listening')
     try { recognition.start() } catch {
+      recognitionRef.current = null
       setVoiceState('idle')
       setVoiceError('Não foi possível iniciar o microfone. Tente novamente.')
     }
+  }
+
+  function stopVoice() {
+    const recognition = recognitionRef.current
+    if (!recognition) return
+    try { recognition.stop() } catch { /* O reconhecimento pode já ter terminado. */ }
   }
 
   async function confirmVoiceDrafts() {
@@ -501,6 +514,9 @@ export default function Home() {
         .app-shell { height: 100dvh; border-radius: 0; }
         .app-shell > .app { border-radius: 0; }
       }
+      /* O círculo decorativo não pode interceptar o toque no microfone. */
+      .mic-orbit-inner { pointer-events: none !important; }
+      .home-mic { position: relative; z-index: 2; cursor: pointer; touch-action: none; pointer-events: auto; user-select: none; -webkit-user-select: none; }
       .home-mic.is-listening { animation: voice-pulse 1.1s ease-in-out infinite; }
       .home-mic:disabled { cursor: wait; }
       @keyframes voice-pulse { 50% { transform: scale(1.07); box-shadow: 0 0 0 14px rgba(83, 190, 139, .15); } }
@@ -526,8 +542,8 @@ export default function Home() {
         <div className="home-date">{dateLabel()}</div>
         <div className="home-weekly"><div><div className="home-weekly-label">Saldo da semana</div><div className="home-weekly-period">{transactionsLoading ? 'Carregando…' : `${weekItems.length} lançamento(s)`}</div></div><div className="home-weekly-value">{money(weekBalance)}</div></div>
         <div className="home-action">
-          <div className="mic-orbit"><div className="mic-orbit-inner" /><button className={`home-mic ${voiceState === 'listening' ? 'is-listening' : ''}`} aria-label="Registrar ganho ou gasto por voz" onClick={startVoice} disabled={voiceState === 'listening'}><Mic /></button></div>
-          <h1>Registre um ganho ou gasto</h1><p>Toque no microfone e fale naturalmente.</p>
+          <div className="mic-orbit"><div className="mic-orbit-inner" /><button type="button" className={`home-mic ${voiceState === 'listening' ? 'is-listening' : ''}`} aria-label="Mantenha pressionado para falar" onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); startVoice() }} onPointerUp={event => { event.preventDefault(); stopVoice() }} onPointerCancel={stopVoice} onLostPointerCapture={stopVoice} onContextMenu={event => event.preventDefault()}><Mic /></button></div>
+          <h1>Registre um ganho ou gasto</h1><p>{voiceState === 'listening' ? 'Solte o microfone para finalizar.' : 'Mantenha o microfone pressionado enquanto fala.'}</p>
           <button className="home-confirm" onClick={() => openForm('income')}>Registrar lançamento</button>
           {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
         </div>
