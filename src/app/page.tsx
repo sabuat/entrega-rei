@@ -15,6 +15,25 @@ type Transaction = {
   date: string
 }
 
+type VoiceDraft = {
+  type: Kind
+  amount: string
+  description: string
+  category: string
+  platform: string
+}
+
+type SpeechRecognitionLike = {
+  lang: string
+  interimResults: boolean
+  continuous: boolean
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null
+  onerror: ((event: { error: string }) => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+
 type DbTransaction = {
   id: string
   type: Kind
@@ -75,6 +94,10 @@ export default function Home() {
   const [date, setDate] = useState(today())
   const [toast, setToast] = useState('')
   const [saving, setSaving] = useState(false)
+  const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'review'>('idle')
+  const [voiceText, setVoiceText] = useState('')
+  const [voiceDrafts, setVoiceDrafts] = useState<VoiceDraft[]>([])
+  const [voiceError, setVoiceError] = useState('')
 
   const supabase = useMemo(() => createClient(), [])
 
@@ -160,6 +183,131 @@ export default function Home() {
     .filter(x => filter === 'all' || x.type === filter)
     .slice()
     .sort((a, b) => b.date.localeCompare(a.date))
+
+  function parseVoiceText(raw: string): VoiceDraft[] {
+    const clauses = raw
+      .replace(/\s+e\s+(?=(?:recebi|ganhei|faturei|entrei|gastei|paguei|comprei|abasteci|desembolsei)\b)/gi, '|')
+      .split(/[|;\n]+/)
+      .map(part => part.trim())
+      .filter(Boolean)
+
+    const expenseWords = /\b(gastei|paguei|comprei|abasteci|desembolsei|despesa|custou)\b/i
+    const knownPlatforms = platforms
+    const drafts: VoiceDraft[] = []
+
+    for (const clause of clauses) {
+      const match = clause.match(/(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)/i)
+      if (!match) continue
+      const rawAmount = match[1]
+      const normalizedAmount = rawAmount.includes(',') ? rawAmount.replace(/\./g, '').replace(',', '.') : rawAmount
+      const value = Number(normalizedAmount)
+      if (!Number.isFinite(value) || value <= 0) continue
+
+      const type: Kind = expenseWords.test(clause) ? 'expense' : 'income'
+      const lower = clause.toLowerCase()
+      const foundPlatform = type === 'income'
+        ? knownPlatforms.find(item => lower.includes(item.toLowerCase())) ?? ''
+        : ''
+      let category = type === 'income' ? 'Delivery' : 'Outros'
+      if (type === 'expense') {
+        if (/gasolina|combust[ií]vel|etanol|diesel|abasteci/.test(lower)) category = 'Combustível'
+        else if (/ped[aá]gio/.test(lower)) category = 'Pedágio'
+        else if (/almo[cç]o|comida|lanche|alimenta/.test(lower)) category = 'Alimentação'
+        else if (/[áa]gua|hidrata/.test(lower)) category = 'Hidratação'
+        else if (/manuten|oficina|pneu|óleo/.test(lower)) category = 'Manutenção'
+        else if (/estacion/.test(lower)) category = 'Estacionamento'
+      } else if (/gorjeta/.test(lower)) category = 'Gorjetas'
+      else if (/b[oô]nus|incentivo/.test(lower)) category = 'Bônus'
+
+      const description = clause
+        .replace(/(?:r\$\s*)?\d+(?:[.,]\d{1,2})?\s*(?:reais?)?/i, '')
+        .replace(/\b(recebi|ganhei|faturei|entrou|gastei|paguei|comprei|abasteci|desembolsei)\b/gi, '')
+        .replace(/\b(do|da|de|no|na|com|em)\b/gi, ' ')
+        .replace(new RegExp(foundPlatform.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '')
+        .replace(/\s+/g, ' ').trim()
+
+      drafts.push({
+        type,
+        amount: String(value.toFixed(2)),
+        description: description || (type === 'income' ? (foundPlatform ? `Entrega ${foundPlatform}` : 'Receita registrada por voz') : 'Despesa registrada por voz'),
+        category,
+        platform: foundPlatform,
+      })
+    }
+    return drafts
+  }
+
+  function startVoice() {
+    setVoiceError('')
+    setVoiceText('')
+    setVoiceDrafts([])
+    const speechWindow = window as typeof window & {
+      SpeechRecognition?: new () => SpeechRecognitionLike
+      webkitSpeechRecognition?: new () => SpeechRecognitionLike
+    }
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition
+    if (!Recognition) {
+      setVoiceError('Seu navegador não oferece reconhecimento de voz. Use o botão Registrar lançamento para preencher manualmente.')
+      return
+    }
+    const recognition = new Recognition()
+    recognition.lang = 'pt-BR'
+    recognition.interimResults = false
+    recognition.continuous = false
+    recognition.onresult = event => {
+      const transcript = Array.from(event.results).map(result => result[0]?.transcript ?? '').join(' ').trim()
+      setVoiceText(transcript)
+      const parsed = parseVoiceText(transcript)
+      setVoiceDrafts(parsed)
+      setVoiceState('review')
+      if (!parsed.length) setVoiceError('Não consegui identificar valores. Tente dizer, por exemplo: “Recebi 180 reais do Mercado Livre e gastei 50 reais de gasolina”.')
+    }
+    recognition.onerror = event => {
+      setVoiceState('idle')
+      setVoiceError(event.error === 'not-allowed'
+        ? 'Permita o acesso ao microfone nas configurações do navegador.'
+        : 'Não foi possível captar sua voz. Tente novamente ou registre manualmente.')
+    }
+    recognition.onend = () => setVoiceState(current => current === 'listening' ? 'idle' : current)
+    setVoiceState('listening')
+    try { recognition.start() } catch {
+      setVoiceState('idle')
+      setVoiceError('Não foi possível iniciar o microfone. Tente novamente.')
+    }
+  }
+
+  async function confirmVoiceDrafts() {
+    if (!userId || !voiceDrafts.length) return
+    const valid = voiceDrafts.filter(item => Number(item.amount.replace(',', '.')) > 0 && item.description.trim())
+    if (!valid.length) {
+      setVoiceError('Confira os valores e as descrições antes de salvar.')
+      return
+    }
+    setSaving(true)
+    const payload = valid.map(item => ({
+      user_id: userId,
+      type: item.type,
+      amount: Number(item.amount.replace(',', '.')),
+      description: item.description.trim(),
+      category: item.category,
+      platform: item.type === 'income' ? (item.platform || null) : null,
+      occurred_at: dateToTimestamp(today()),
+    }))
+    const { error } = await supabase.from('transactions').insert(payload)
+    if (error) {
+      console.error('Erro ao salvar lançamentos por voz:', error)
+      setVoiceError('Não foi possível salvar os lançamentos. Confira sua conexão e tente novamente.')
+      setSaving(false)
+      return
+    }
+    await loadTransactions(userId)
+    setVoiceState('idle')
+    setVoiceDrafts([])
+    setVoiceText('')
+    setVoiceError('')
+    setSaving(false)
+    notify(`${valid.length} lançamento(s) salvo(s)!`)
+  }
 
   function openForm(kind: Kind, item?: Transaction) {
     setType(kind)
@@ -302,17 +450,86 @@ export default function Home() {
         .app.home-layout .home-action h1 { font-size: clamp(16px, 2.4vh, 20px); }
         .app.home-layout .home-action p { font-size: 12px; }
       }
+
+      /* Estrutura global: publicidade fixa e rolagem somente no conteúdo */
+      body:has(.app-shell) {
+        height: 100dvh !important;
+        min-height: 0 !important;
+        overflow: hidden !important;
+        padding: 0 !important;
+      }
+      .app-shell {
+        width: min(100%, 440px);
+        height: 100dvh;
+        min-height: 0;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        position: relative;
+      }
+      .app-shell > .ad-slot {
+        flex: 0 0 58px;
+        width: 100%;
+        height: 58px;
+        min-height: 58px;
+        margin: 0;
+      }
+      .app-shell > .app {
+        flex: 1 1 auto;
+        width: 100%;
+        max-width: none;
+        height: 0;
+        min-height: 0;
+        max-height: none;
+        margin: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+      .app-shell > .app.home-layout {
+        height: auto;
+        overflow: hidden !important;
+      }
+      .app-shell > .app.home-layout .home-screen {
+        height: 100%;
+        min-height: 0;
+      }
+      @media (min-width: 600px) {
+        body:has(.app-shell) { padding: 0 !important; }
+        .app-shell { height: 100dvh; border-radius: 0; }
+        .app-shell > .app { border-radius: 0; }
+      }
+      .home-mic.is-listening { animation: voice-pulse 1.1s ease-in-out infinite; }
+      .home-mic:disabled { cursor: wait; }
+      @keyframes voice-pulse { 50% { transform: scale(1.07); box-shadow: 0 0 0 14px rgba(83, 190, 139, .15); } }
+      .voice-error { color: #d98b77; font-size: 12px; line-height: 1.45; text-align: center; max-width: 300px; }
+      .voice-overlay { position: fixed; inset: 0; z-index: 1000; background: rgba(5, 12, 24, .82); display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; }
+      .voice-panel { width: min(100%, 420px); max-height: min(88dvh, 760px); overflow-y: auto; background: #101d32; color: #f5f7fb; border: 1px solid rgba(255,255,255,.12); border-radius: 20px; padding: 22px; box-sizing: border-box; position: relative; }
+      .voice-panel h2 { font-size: 21px; margin: 0 34px 12px 0; }
+      .voice-close { position: absolute; right: 16px; top: 12px; border: 0; background: transparent; color: #fff; font-size: 28px; cursor: pointer; }
+      .voice-transcript { color: #b7c4d8; font-size: 13px; line-height: 1.5; padding: 10px 12px; background: rgba(255,255,255,.06); border-radius: 10px; }
+      .voice-draft { border-top: 1px solid rgba(255,255,255,.12); padding: 14px 0; display: grid; gap: 10px; }
+      .voice-draft label { display: grid; gap: 5px; color: #b7c4d8; font-size: 12px; }
+      .voice-draft input, .voice-draft select { width: 100%; min-height: 42px; border-radius: 9px; border: 1px solid rgba(255,255,255,.18); background: #172740; color: #fff; padding: 9px 10px; box-sizing: border-box; font: inherit; }
+      .voice-draft .type-switch { display: flex; gap: 8px; }
+      .voice-remove, .voice-again { border: 0; background: transparent; color: #9ec9f1; padding: 9px; cursor: pointer; }
+      .voice-panel > .primary { width: 100%; margin-top: 8px; }
+      .voice-again { width: 100%; }
     `}</style>
-    <div className="ad-slot" aria-label="Espaço reservado para publicidade">Publicidade</div>
-    <div className={`app ${screen === 'home' ? 'home-layout' : ''}`}>
+    <div className="app-shell">
+      <div className="ad-slot" aria-label="Espaço reservado para publicidade">Publicidade</div>
+      <div className={`app ${screen === 'home' ? 'home-layout' : ''}`}>
       {screen === 'home' && <section className="screen active home-screen">
         <div className="home-heading"><div className="brand">entrega<span>.rei</span></div><div className="user-chip"><div className="avatar">{userEmail.slice(0, 2).toUpperCase()}</div><span>{userEmail.split('@')[0]}</span></div></div>
         <div className="home-date">{dateLabel()}</div>
         <div className="home-weekly"><div><div className="home-weekly-label">Saldo da semana</div><div className="home-weekly-period">{transactionsLoading ? 'Carregando…' : `${weekItems.length} lançamento(s)`}</div></div><div className="home-weekly-value">{money(weekBalance)}</div></div>
         <div className="home-action">
-          <div className="mic-orbit"><div className="mic-orbit-inner" /><button className="home-mic" aria-label="Registrar ganho ou gasto" onClick={() => openForm('income')}><Mic /></button></div>
+          <div className="mic-orbit"><div className="mic-orbit-inner" /><button className={`home-mic ${voiceState === 'listening' ? 'is-listening' : ''}`} aria-label="Registrar ganho ou gasto por voz" onClick={startVoice} disabled={voiceState === 'listening'}><Mic /></button></div>
           <h1>Registre um ganho ou gasto</h1><p>Toque no microfone e fale naturalmente.</p>
           <button className="home-confirm" onClick={() => openForm('income')}>Registrar lançamento</button>
+          {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
         </div>
       </section>}
       {screen === 'add' && <section className="screen active"><button className="back" onClick={() => setScreen('home')}>← Início</button><h1 className="page-title">{editing ? 'Editar lançamento' : 'Novo lançamento'}</h1><p className="sub">Registre o valor que entrou ou saiu.</p><div className="form-card">
@@ -325,7 +542,26 @@ export default function Home() {
       </div></section>}
       {screen === 'history' && <section className="screen active"><h1 className="page-title">Histórico</h1><p className="sub">Todas as suas movimentações em um só lugar.</p><div className="filter">{(['all', 'income', 'expense'] as const).map(f => <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>{f === 'all' ? 'Todas' : f === 'income' ? 'Receitas' : 'Despesas'}</button>)}</div><div className="card">{transactionsLoading ? <div className="empty">Carregando lançamentos…</div> : visible.length ? visible.map(x => <Movement key={x.id} item={x} onEdit={() => openForm(x.type, x)} onDelete={() => void remove(x.id)} />) : <div className="empty">Nenhuma movimentação encontrada.</div>}</div></section>}
       {screen === 'reports' && <section className="screen active"><h1 className="page-title">Relatórios</h1><p className="sub">Entenda como está o resultado do seu trabalho.</p><div className="filter"><button className={period === 'week' ? 'active' : ''} onClick={() => setPeriod('week')}>Semana</button><button className={period === 'month' ? 'active' : ''} onClick={() => setPeriod('month')}>Mês</button></div><div className="balance"><div className="eyebrow">RESULTADO {period === 'week' ? 'DA SEMANA' : 'DO MÊS'}</div><div className="amount">{money(reportIncome - reportExpense)}</div><div className="balance-grid"><div><small>Receitas</small><strong className="positive">{money(reportIncome)}</strong></div><div><small>Despesas</small><strong className="negative">{money(reportExpense)}</strong></div></div></div><div className="stat-grid"><div className="stat"><small>Lançamentos</small><strong>{selected.length}</strong></div><div className="stat"><small>Saldo semanal atual</small><strong>{money(weekBalance)}</strong></div></div><p className="hint">Os valores são calculados a partir dos lançamentos salvos na sua conta.</p></section>}
+      {voiceState === 'review' && <div className="voice-overlay" role="dialog" aria-modal="true" aria-labelledby="voice-review-title">
+        <div className="voice-panel">
+          <button className="voice-close" onClick={() => { setVoiceState('idle'); setVoiceDrafts([]); setVoiceError('') }} aria-label="Fechar">×</button>
+          <h2 id="voice-review-title">Confira seus lançamentos</h2>
+          <p className="voice-transcript">“{voiceText}”</p>
+          {voiceDrafts.map((item, index) => <div className="voice-draft" key={index}>
+            <div className="type-switch"><button type="button" className={item.type === 'income' ? 'selected' : ''} onClick={() => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, type: 'income', category: incomeCategories[0] } : x))}>＋ Receita</button><button type="button" className={item.type === 'expense' ? 'selected' : ''} onClick={() => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, type: 'expense', category: expenseCategories[0], platform: '' } : x))}>－ Despesa</button></div>
+            <label>Valor (R$)<input type="number" min="0.01" step="0.01" value={item.amount} onChange={e => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, amount: e.target.value } : x))} /></label>
+            <label>Descrição<input value={item.description} onChange={e => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, description: e.target.value } : x))} /></label>
+            {item.type === 'income' && <label>Plataforma<select value={item.platform} onChange={e => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, platform: e.target.value } : x))}><option value="">Não informada</option>{platforms.map(p => <option key={p}>{p}</option>)}</select></label>}
+            <label>Categoria<select value={item.category} onChange={e => setVoiceDrafts(old => old.map((x, i) => i === index ? { ...x, category: e.target.value } : x))}>{(item.type === 'income' ? incomeCategories : expenseCategories).map(c => <option key={c}>{c}</option>)}</select></label>
+            <button type="button" className="voice-remove" onClick={() => setVoiceDrafts(old => old.filter((_, i) => i !== index))}>Remover lançamento</button>
+          </div>)}
+          {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
+          <button className="primary" disabled={saving || !voiceDrafts.length} onClick={() => void confirmVoiceDrafts()}>{saving ? 'Salvando…' : 'Confirmar e salvar'}</button>
+          <button className="voice-again" onClick={() => { setVoiceState('idle'); startVoice() }}>Gravar novamente</button>
+        </div>
+      </div>}
       <nav className="nav"><button className={screen === 'home' ? 'active' : ''} onClick={() => setScreen('home')}><HomeIcon />Início</button><button className={screen === 'add' ? 'active' : ''} onClick={() => openForm('income')}><PlusIcon />Lançar</button><button className={screen === 'reports' ? 'active' : ''} onClick={() => setScreen('reports')}><ChartIcon />Relatórios</button><button className={screen === 'history' ? 'active' : ''} onClick={() => setScreen('history')}><ListIcon />Histórico</button></nav>
+      </div>
     </div><div className="toast" style={{ opacity: toast ? 1 : 0 }}>{toast}</div>
   </>
 }
